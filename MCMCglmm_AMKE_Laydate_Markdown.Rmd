@@ -1,0 +1,446 @@
+---
+title: "MCMCglmm_AMKE_laydate_heritability"
+author: "Stephanie Galla"
+date: "24/09/2020"
+output: html_document
+---
+
+## Introduction
+
+This file will walk us through the process of running a heritability analysis on lay date using the programme MCMCglmm. 
+
+Heritability is the transmision of variation surrounding a trait in a population from one generation to the next. It is calculated by dividing the amount of additive genetic variance (Va) by the variation surrounding a phenotype (Vp), or in other words h2 = Va/Vp. 
+
+MCMCglmm is an animal model, which is a mixed model that takes into account pedigree-based relationships and other effects. Unlike other methods of estimating heritability, the animal model is able to cope with missing data in the pedigree (Postma & Charman 2007; Wilson et al. 2010). Because it utilizes the entire pedigree, as opposed to just parent-offspring relationships, it tends to provide more precise estimates of heritability (Wilson et al. 2010).
+
+Here are a few resources for running animal models, which I have referred to here:
+1) WAMWiki (www.wildanimalmodels.org), which provides updated tutorials from Wilson et al. 2010. 
+2) The Animal Model Tutorial in MCMCglmm by Pierre de Villemereuil (http://devillemereuil.legtux.org/wp-content/uploads/2012/12/tuto_en.pdf), which provides a very detailed explanation of the Animal Model.
+3) I've also been in contact with Anna Santure (a.santure@auckland.ac.nz) and Pierre de Villemereuil (pierre.devillemereuil@ephe.psl.eu) as I went through these, for support. 
+
+## Setup
+
+First, let's set up the environment to run these analyses, and attach the required packages.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.width=6, fig.height=4) 
+library(MCMCglmm)
+library(MasterBayes)
+library(coda)
+library(dplyr)
+library(ggpubr)
+knitr::opts_knit$set(root.dir ="~/Desktop/BSU/SERDP/Heritability/Updated_Data")
+```
+
+## Data Input
+
+Now, we'll load relavent data sets, including lay date information for all known individuals (kestrelRM), lay date information separated by sex (kestrelRM_male, kestrelRM_female), and pedigree information (Ped_Ordered). These files were prepared by Julie Heath in June 2020. Note: when Stephanie analyzed these data sets, there were originally two individuals in the lay date sheet with NA's as their IDs. For program compliance, these were replaced with 1000000000 and 1000000001, and their parents were listed as NA's in the pedigree. Further, we have created a Julian date for the data sets from Karen Steenhof. This was done by substracting 40 days from the hatch date, if available. If hatch date was not available from Karen's data, we just used the discovery date. 
+
+```{r}
+##Input the lay date data:
+kestrelRM <- as.data.frame(read.csv(file="AMKE_All_20200820.csv", header=TRUE))
+head(kestrelRM)
+#Provides summary statistics:
+summary(kestrelRM)
+#Provides structure of data frame: 
+str(kestrelRM)
+#Create new columns with data types needed:
+kestrelRM$animal<-as.factor(kestrelRM$band)
+kestrelRM$discdate<-as.numeric(kestrelRM$discovery_date)
+kestrelRM$Year<-as.factor(kestrelRM$year)
+str(kestrelRM)
+#creating a new variable called ID so you can fit one ID section to the pedigree and another the 'animal' separately:
+kestrelRM$ID<-kestrelRM$animal
+str(kestrelRM)
+
+##Read in lay date information for all males and females: 
+kestrelRM_Female <- as.data.frame(read.csv("AMKE_female_20200820.csv", header=TRUE))
+kestrelRM_Female$animal<-as.factor(kestrelRM_Female$band)
+kestrelRM_Female$discdate<-as.numeric(kestrelRM_Female$discovery_date)
+kestrelRM_Female$Year<-as.factor(kestrelRM_Female$year)
+kestrelRM_Female$ID<-kestrelRM_Female$animal
+str(kestrelRM_Female)
+kestrelRM_Male <- as.data.frame(read.csv("AMKE_male_20200820.csv", header=TRUE))
+kestrelRM_Male$animal<-as.factor(kestrelRM_Male$band)
+kestrelRM_Male$discdate<-as.numeric(kestrelRM_Male$discovery_date)
+kestrelRM_Male$Year<-as.factor(kestrelRM_Male$year)
+kestrelRM_Male$ID<-kestrelRM_Male$animal
+str(kestrelRM_Male)
+
+##Read in the pedigree information, order the file, and designate it as a data frame:
+Ped <- read.csv(file="AKped20200609.csv", header=TRUE)
+Ordered_Ped <- MasterBayes::orderPed(Ped, time_born = NULL)
+Ordered_Ped <- as.data.frame(Ordered_Ped)
+names(Ordered_Ped)[1] <- "animal"
+names(Ordered_Ped)[2] <- "sire"
+names(Ordered_Ped)[3] <- "dam"
+str(Ordered_Ped)
+
+#Turn all of the data interped as factors:
+for (x in 1:3) Ordered_Ped[, x] <- as.factor(Ordered_Ped[, x])
+str(Ordered_Ped) #shows you interp
+
+```
+
+## Normality testing.
+
+Now, we're going to test for normality of our target data set, to see if it follow's a normal/Gaussian distribution. This information can be implimented into MCMCglmm down the track. 
+
+The first time this was calculated, SJG noticed a heavy skew in the data. SJG is in contact with Anna Santure to ask about the best way to assess the distribution 'family' this data belongs to (e.g., Gaussian vs. Poisson). In the interim, subsequent analyses have included a Poisson and non-Poisson (non-specified) families below.
+
+```{r}
+
+#Test for normality of laydate data:
+
+ggpubr::ggdensity(kestrelRM$julian_lay, main = "Density of Lay Date", xlab = "Lay Date")
+ggpubr::ggqqplot(kestrelRM$julian_lay)
+shapiro.test(kestrelRM$julian_lay)
+
+kestrelRM$logtrial <- log(kestrelRM$julian_lay)
+
+#Observe normality of lay date
+ggplot(data = kestrelRM) + geom_density(aes(x = logtrial), size = 2)
+
+ggplot(data = kestrelRM) + geom_density(aes(x = julian_lay), size = 2)
+
+```
+
+## Model 6.1a
+
+In this section, we will run a model based on previous runs, with a minimum number of fixed and random effects. 
+
+In this model, lay date (what we're interested in) is a fixed effect, while the 'animal' (representing the additive genetic effect of the animal) and ID (for repeated measures) are random effects. 
+
+As a note on random and fixed effects, a fixed effect is a factor (e.g., age, sex) that is a known source of variation, whereas unknown sources of variation (e.g., nest box, habitat patch) are listed as random effects (Wilson 2008). Another way of thinking about this: we know that fixed effects drive the relationship we're seeing. We do knot know how random effects are driving the relationship we're seeing. Animal and ID are listed as random effects here, because we do not know how the individual's genetic variation or repeated measures will effect lay date. 
+
+In all models here, we are using a 'gentle' prior with parameter extension that allows for better mixing, as per de Villemereuil et al. 2018. A prior is a probability distribution that gives you information about a variable ahead of time. In MCMCglmm, V denotes the 'prior'distribution , while nu denotes the degree of belief in the prior distribution (smaller nu = less belief). According to Pierre (via email), using an informative prior with variation from the distribution of interest (as originally suggested by Wilson 2010, now updated on www.wildanimalmodels.org) is not appropriate.
+
+In all the models implimented in R markdown, we have decided to use all individuals, as opposed to females only. While female participation in lay date is fundamental, we have included males, as their early presence makes breeding opportunities available. Here, we also try to reduce fixed effects to see how they effect the model.
+
+Finally, we have used a large number of itterations in all models described here, with a high burn-in, to improve trace (as per previous MCMCglmm runs).
+
+```{r}
+#First, we are going to set a prior. 
+prior6.1a <- list(G=list(G1=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000), G2=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000)), R=list(V=1, nu=0.02))
+
+#Model specification for simple animal model, with no extra fixed or mixed effects.
+model6.1a <- MCMCglmm(julian_lay~1,random=~animal+ID, pedigree=Ordered_Ped,data=kestrelRM,prior=prior6.1a, verbose=FALSE, nitt=500000, thin=50, burnin=80000)
+
+#To tell how confident we are that the MCMC found good answers, we'll first look at plot. 
+
+#We're looking for traces that are stationary. *$Sol is the fixed effects variances, and *$VCV is the random effects variances. We want to make sure that the trace is fairly consistent (could you run a line through the middle and hit most of the trace?).
+plot(model6.1a$Sol)
+plot(model6.1a$VCV)
+
+#Another way to check convergence (besides looking at the trace plots) is a Heidelberger test (Heidelberger and Welch 1983) from the coda package. If all your variance components have passed, then it is all good.
+coda::heidel.diag(model6.1a$VCV)
+
+#Next, we'll look at the autocorrelation diagnostic. Autocorrelation less than 0.1 for the first lag is pretty good.
+autocorr.diag(model6.1a$Sol)
+autocorr.diag(model6.1a$VCV)
+
+#Finally, we'll look at the effective size. Getting a large effective size is important. <1000 is small, and >10000 is ideal.
+effectiveSize(model6.1a$Sol)
+effectiveSize(model6.1a$VCV)
+summary(model6.1a)
+
+#To calculate heritability:
+posterior.heritability6.1a <- model6.1a$VCV[,"animal"]/(model6.1a$VCV[,"animal"]+model6.1a$VCV[,"ID"]+model6.1a$VCV[,"units"])
+#This is H2, known as heritability
+posterior.mode(posterior.heritability6.1a)
+#These are your confidence intervals:
+HPDinterval(posterior.heritability6.1a,0.95)
+#And you can plot your heritability, too
+plot(posterior.heritability6.1a)
+
+
+# Calculating extra parameters, for the simulation
+
+#Intercept
+mu_model6.1a <- model6.1a[["Sol"]][ , "(Intercept)"]
+mu_model6.1a
+#this is used in the model:
+max(mu_model6.1a)
+
+#Additive genetic variance
+va_model6.1a <- model6.1a[["VCV"]][ , "animal"]
+va_model6.1a
+mean(va_model6.1a)
+
+#ID genetic variance
+va_ID_model6.1a <- model6.1a[["VCV"]][ , "ID"]
+va_ID_model6.1a
+mean(va_ID_model6.1a)
+
+#Residual variance
+vr_model6.1a <- model6.1a[["VCV"]][ , "units"]
+mean(vr_model6.1a)
+```
+
+
+## Model 6.1a2
+
+This is the same model as before, only it has a Poisson family listed:
+
+
+```{r}
+model6.1a2 <- MCMCglmm(julian_lay~1,random=~animal+ID, pedigree=Ordered_Ped,data=kestrelRM, prior=prior6.1a,family = "poisson", verbose=FALSE,nitt=500000,thin=50,burnin=80000)
+
+#Check trace:
+plot(model6.1a2$Sol)
+plot(model6.1a2$VCV)
+
+#Heidelberger test:
+coda::heidel.diag(model6.1a2$VCV)
+
+#Autocorrelation diagnostic:
+autocorr.diag(model6.1a2$Sol)
+autocorr.diag(model6.1a2$VCV)
+
+#Effective size: 
+effectiveSize(model6.1a2$Sol)
+effectiveSize(model6.1a2$VCV)
+summary(model6.1a2)
+
+#To calculate heritability:
+posterior.heritability6.1a2 <- model6.1a2$VCV[,"animal"]/(model6.1a2$VCV[,"animal"]+model6.1a2$VCV[,"ID"]+model6.1a2$VCV[,"units"])
+posterior.mode(posterior.heritability6.1a2)
+HPDinterval(posterior.heritability6.1a2,0.95)
+plot(posterior.heritability6.1a2)
+
+```
+
+## Model 6.1b
+
+Year is added in here as a fixed effect, 
+
+```{r}
+
+prior6.1b <- list(G=list(G1=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000), G2=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000), G3=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000)), R=list(V=1, nu=0.02))
+
+model6.1b <- MCMCglmm(julian_lay~1,random=~animal+ID+Year, pedigree=Ordered_Ped, data=kestrelRM, prior=prior6.1b, verbose=FALSE, nitt=500000, thin=50,burnin=80000)
+
+#Check trace:
+plot(model6.1b$Sol)
+plot(model6.1b$VCV)
+
+#Heidelberger test:
+coda::heidel.diag(model6.1b$VCV)
+
+#Autocorrelation diagnostic:
+autocorr.diag(model6.1b$Sol)
+autocorr.diag(model6.1b$VCV)
+
+#Effective size: 
+effectiveSize(model6.1b$Sol)
+effectiveSize(model6.1b$VCV)
+summary(model6.1b)
+
+#To calculate heritability:
+posterior.heritability6.1b <- model6.1b$VCV[,"animal"]/(model6.1b$VCV[,"animal"]+model6.1b$VCV[,"ID"]+model6.1b$VCV[,"Year"]+model6.1b$VCV[,"units"])
+posterior.mode(posterior.heritability6.1b)
+HPDinterval(posterior.heritability6.1b,0.95)
+plot(posterior.heritability6.1b)
+
+```
+
+```{r}
+
+model6.1b2 <- MCMCglmm(julian_lay~1,random=~animal+ID+Year, pedigree=Ordered_Ped, data=kestrelRM, prior=prior6.1b, verbose=FALSE, nitt=500000, family = "poisson", thin=50, burnin=80000)
+
+#Check trace:
+plot(model6.1b2$Sol)
+plot(model6.1b2$VCV)
+
+#Heidelberger test:
+coda::heidel.diag(model6.1b2$VCV)
+
+#Autocorrelation diagnostic:
+autocorr.diag(model6.1b2$Sol)
+autocorr.diag(model6.1b2$VCV)
+
+#Effective size: 
+effectiveSize(model6.1b2$Sol)
+effectiveSize(model6.1b2$VCV)
+summary(model6.1b2)
+
+#To calculate heritability:
+posterior.heritability6.1b2 <- model6.1b2$VCV[,"animal"]/(model6.1b2$VCV[,"animal"]+model6.1b2$VCV[,"ID"]+model6.1b2$VCV[,"Year"]+model6.1b2$VCV[,"units"])
+posterior.mode(posterior.heritability6.1b2)
+HPDinterval(posterior.heritability6.1b2,0.95)
+plot(posterior.heritability6.1b2)
+```
+
+
+## Model 6.1c
+
+```{r}
+
+prior6.1c <- list(G=list(G1=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000), G2=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000), G3=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000)), R=list(V=1, nu=0.02))
+
+model6.1c <- MCMCglmm(julian_lay~1+sex+year,random=~animal+ID+Year, pedigree=Ordered_Ped, data=kestrelRM, prior=prior6.1c, verbose=FALSE, nitt=500000, thin=50,burnin=80000)
+
+#Check trace:
+plot(model6.1c$Sol)
+plot(model6.1c$VCV)
+
+#Heidelberger test:
+coda::heidel.diag(model6.1c$VCV)
+
+#Autocorrelation diagnostic:
+autocorr.diag(model6.1c$Sol)
+autocorr.diag(model6.1c$VCV)
+
+#Effective size: 
+effectiveSize(model6.1c$Sol)
+effectiveSize(model6.1c$VCV)
+summary(model6.1c)
+
+#To calculate heritability:
+posterior.heritability6.1c <- model6.1c$VCV[,"animal"]/(model6.1c$VCV[,"animal"]+model6.1c$VCV[,"ID"]+model6.1c$VCV[,"Year"]+model6.1c$VCV[,"units"])
+posterior.mode(posterior.heritability6.1c)
+HPDinterval(posterior.heritability6.1c,0.95)
+plot(posterior.heritability6.1c)
+
+```
+
+## Model 6.1c2
+
+```{r}
+model6.1c2 <- MCMCglmm(julian_lay~1+sex+year,random=~animal+ID+Year, pedigree=Ordered_Ped, data=kestrelRM, prior=prior6.1c, family = "poisson", verbose=FALSE, nitt=500000, thin=50,burnin=80000)
+
+#Check trace:
+plot(model6.1c2$Sol)
+plot(model6.1c2$VCV)
+
+#Heidelberger test:
+coda::heidel.diag(model6.1c2$VCV)
+
+#Autocorrelation diagnostic:
+autocorr.diag(model6.1c2$Sol)
+autocorr.diag(model6.1c2$VCV)
+
+#Effective size: 
+effectiveSize(model6.1c2$Sol)
+effectiveSize(model6.1c2$VCV)
+summary(model6.1c2)
+
+#To calculate heritability:
+posterior.heritability6.1c2 <- model6.1c2$VCV[,"animal"]/(model6.1c2$VCV[,"animal"]+model6.1c2$VCV[,"ID"]+model6.1c2$VCV[,"Year"]+model6.1c2$VCV[,"units"])
+posterior.mode(posterior.heritability6.1c2)
+HPDinterval(posterior.heritability6.1c2,0.95)
+plot(posterior.heritability6.1c2)
+```
+
+```{r}
+prior3.4e <- list(R = list(V = 1, nu = 1), G = list(G1 = list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000), G2 = list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000), G3 = list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000)))
+
+model3.4e <- MCMCglmm(julian_lay~1+sex+year,random=~animal+ID+Year,
+pedigree=Ordered_Ped,data=kestrelRM,prior=prior3.4e,verbose=FALSE,
+nitt=500000,thin=50,burnin=80000)
+
+model3.4e_Summary <- summary(model3.4e)
+model3.4e_Summary
+
+plot(model3.4e$Sol)
+plot(model3.4e$VCV)
+
+coda::heidel.diag(model3.4e$VCV)
+
+autocorr.diag(model3.4e$Sol)
+autocorr.diag(model3.4e$VCV)
+
+effectiveSize(model3.4e$Sol)
+effectiveSize(model3.4e$VCV)
+
+#The following are giving us estimates of repeatability and heritability.
+model3.4.VPe <- model3.4e$VCV[,"animal"]+model3.4e$VCV[,"Year"]+model3.4e$VCV[,"units"]
+model3.4.IDplusVAe <- model3.4e$VCV[,"animal"]
+posterior.repeatability3.4e <- posterior.mode(model3.4.IDplusVAe/model3.4.VPe)
+posterior.heritability3.4e <- model3.4e$VCV[,"animal"]/(model3.4e$VCV[,"animal"]+model3.4e$VCV[,"Year"]+model3.4e$VCV[,"units"])
+posterior.mode(posterior.heritability3.4e)
+HPDinterval(posterior.heritability3.4e,0.95)
+plot(posterior.heritability3.4e)
+```
+
+```{r}
+prior6.1a <- list(G=list(G1=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000), G2=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000)), R=list(V=1, nu=0.02))
+
+prior6.1b <- list(G=list(G1=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000), G2=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000), G3=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000)), R=list(V=1, nu=0.02))
+
+prior6.1c <- list(G=list(G1=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000), G2=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000), G3=list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000)), R=list(V=1, nu=0.02))
+
+model6.1a <- MCMCglmm(julian_lay~1,random=~animal+ID,
+	pedigree=Ordered_Ped,data=kestrelRM,prior=prior6.1a,verbose=FALSE,
+	nitt=500000,thin=50,burnin=80000)
+
+model6.1a2 <- MCMCglmm(julian_lay~1,random=~animal+ID,	pedigree=Ordered_Ped,data=kestrelRM,prior=prior6.1a,family = "poisson", verbose=FALSE,nitt=500000,thin=50,burnin=80000)
+  
+model6.1b <- MCMCglmm(julian_lay~1,random=~animal+ID+year,
+	pedigree=Ordered_Ped,data=kestrelRM,prior=prior6.1b,verbose=FALSE,
+	nitt=500000,thin=50,burnin=80000)
+  
+model6.1c <- MCMCglmm(julian_lay~1,random=~animal+ID+Year,
+	pedigree=Ordered_Ped,data=kestrelRM,prior=prior6.1c,verbose=FALSE,
+	nitt=500000,thin=50,burnin=80000)
+
+#The following are giving us estimates of repeatability and heritability.
+model6.1.VPa <- model6.1a$VCV[,"animal"]+model6.1a$VCV[,"ID"]+model6.1a$VCV[,"units"]
+model6.1.IDplusVAa <- model6.1a$VCV[,"animal"]
+posterior.repeatability6.1a <- posterior.mode(model6.1.IDplusVAa/model6.1.VPa)
+posterior.heritability6.1a <- model6.1a$VCV[,"animal"]/(model6.1a$VCV[,"animal"]+model6.1a$VCV[,"ID"]+model6.1a$VCV[,"units"])
+posterior.mode(posterior.heritability6.1a)
+HPDinterval(posterior.heritability6.1a,0.95)
+plot(posterior.heritability6.1a)
+
+#The following are giving us estimates of repeatability and heritability.
+model6.1.VPa2 <- model6.1a2$VCV[,"animal"]+model6.1a2$VCV[,"ID"]+model6.1a2$VCV[,"units"]
+model6.1.IDplusVAa2 <- model6.1a2$VCV[,"animal"]
+posterior.repeatability6.1a2 <- posterior.mode(model6.1.IDplusVAa2/model6.1.VPa2)
+posterior.heritability6.1a2 <- model6.1a2$VCV[,"animal"]/(model6.1a2$VCV[,"animal"]+model6.1a2$VCV[,"ID"]+model6.1a2$VCV[,"units"])
+posterior.mode(posterior.heritability6.1a2)
+HPDinterval(posterior.heritability6.1a2,0.95)
+plot(posterior.heritability6.1a2)
+
+#The following are giving us estimates of repeatability and heritability.
+model6.1.VPb <- model6.1b$VCV[,"animal"]+model6.1b$VCV[,"ID"]+model6.1b$VCV[,"year"]+model6.1b$VCV[,"units"]
+model6.1.IDplusVAb <- model6.1b$VCV[,"animal"]
+posterior.repeatability6.1b <- posterior.mode(model6.1.IDplusVAb/model6.1.VPb)
+posterior.heritability6.1b <- model6.1b$VCV[,"animal"]/(model6.1b$VCV[,"animal"]+model6.1b$VCV[,"ID"]+model6.1b$VCV[,"year"]+model6.1b$VCV[,"units"])
+posterior.mode(posterior.heritability6.1b)
+HPDinterval(posterior.heritability6.1b,0.95)
+plot(posterior.heritability6.1b)
+
+#The following are giving us estimates of repeatability and heritability.
+model6.1.VPc <- model6.1c$VCV[,"animal"]+model6.1b$VCV[,"ID"]+model6.1c$VCV[,"Year"]+model6.1c$VCV[,"units"]
+model6.1.IDplusVAc <- model6.1c$VCV[,"animal"]
+posterior.repeatability6.1c <- posterior.mode(model6.1.IDplusVAc/model6.1.VPc)
+posterior.heritability6.1c <- model6.1c$VCV[,"animal"]/(model6.1c$VCV[,"animal"]+model6.1c$VCV[,"ID"]+model6.1c$VCV[,"Year"]+model6.1c$VCV[,"units"])
+posterior.mode(posterior.heritability6.1c)
+HPDinterval(posterior.heritability6.1c,0.95)
+plot(posterior.heritability6.1c)
+
+```
+
+### Glossary of terms:
+
+na.rm = TRUE means that NA's will not be considered. 
+G: random effects variance, R = prior on residual variance
+V: prior expectation
+nu: degree of belief (closer to 0 means less belief).
+Sol: fixed effects variances
+VCV: random effects variances
+
+### References:
+
+Heidelberger P, Welch PD. 1983 Simulation run length control in the presence of an initial transient. Opns Res., 31, 1109-44.
+
+Posta E, Charmantier A. 2007. What 'animal models' can and cannot tell ornithologists about the genetics of wild populations. Journal of Ornithology, 148, 633-642. 
+
+Wilson AJ. 2008. Why h2 does not always equal VA/VP? Journal of Evolutionary Biology, 21, 647-650.
+
+Wilson AJ, Reale D, Clements MN, Morrissey MM, Postma E, Walling CA, Kruuk LEB, Nussey DH. 2010. An ecologist's guide to the animal model. Journal of Animal ecology, 79, 13-26
+
+git link:
+https://github.com/sgalla32/MCMCglmm_AMKE_Laydate.git
